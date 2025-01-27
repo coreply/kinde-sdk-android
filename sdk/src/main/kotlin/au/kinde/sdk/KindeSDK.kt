@@ -1,5 +1,6 @@
 package au.kinde.sdk
 
+import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Base64.URL_SAFE
@@ -44,7 +45,7 @@ import kotlin.concurrent.thread
  * @since 1.0
  */
 class KindeSDK(
-    activity: ComponentActivity,
+    private val context: Context,
     private val loginRedirect: String,
     private val logoutRedirect: String,
     private val scopes: List<String> = DEFAULT_SCOPES,
@@ -57,45 +58,7 @@ class KindeSDK(
 
     private lateinit var state: AuthState
 
-    private val authService = AuthorizationService(activity)
-
-    private val launcher = activity.registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val data = result.data
-
-        if (result.resultCode == ComponentActivity.RESULT_CANCELED && data != null) {
-            val ex = AuthorizationException.fromIntent(data)
-            ex?.let { sdkListener.onException(LogoutException("${ex.errorDescription}")) }
-        }
-
-        if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
-            val resp = AuthorizationResponse.fromIntent(data)
-            val ex = AuthorizationException.fromIntent(data)
-            state.update(resp, ex)
-            store.saveState(state.jsonSerializeString())
-            resp?.let {
-                thread {
-                    getToken(resp.createTokenExchangeRequest())
-                }
-            }
-            ex?.let { sdkListener.onException(AuthException("${ex.error} ${ex.errorDescription}")) }
-        }
-    }
-
-    private val endTokenLauncher = activity.registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        val data = result.data
-        if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
-            val resp = EndSessionResponse.fromIntent(data)
-            val ex = AuthorizationException.fromIntent(data)
-            apiClient.setBearerToken("")
-            sdkListener.onLogout()
-            store.clearState()
-            ex?.let { sdkListener.onException(LogoutException("${ex.error} ${ex.errorDescription}")) }
-        }
-    }
+    private val authService = AuthorizationService(context)
 
     private val domain: String
     private val clientId: String
@@ -109,8 +72,8 @@ class KindeSDK(
     private val usersApi: UsersApi
 
     init {
-        val appInfo = activity.packageManager.getApplicationInfo(
-            activity.packageName,
+        val appInfo = context.packageManager.getApplicationInfo(
+            context.packageName,
             PackageManager.GET_META_DATA
         )
         val metaData = appInfo.metaData
@@ -144,7 +107,7 @@ class KindeSDK(
             Uri.parse(LOGOUT_URL.format(domain))
         )
 
-        store = Store(activity, domain)
+        store = Store(context, domain)
 
         val stateJson = store.getState()
         state = if (!stateJson.isNullOrEmpty()) {
@@ -213,6 +176,23 @@ class KindeSDK(
     }
 
     fun logout() {
+        if (context !is ComponentActivity) {
+            throw (IllegalStateException("Activity must be instance of ComponentActivity"))
+            return
+        }
+        val endTokenLauncher = context.registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            val data = result.data
+            if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
+                val resp = EndSessionResponse.fromIntent(data)
+                val ex = AuthorizationException.fromIntent(data)
+                apiClient.setBearerToken("")
+                sdkListener.onLogout()
+                store.clearState()
+                ex?.let { sdkListener.onException(LogoutException("${ex.error} ${ex.errorDescription}")) }
+            }
+        }
         val endSessionRequest = EndSessionRequest.Builder(serviceConfiguration)
             .setPostLogoutRedirectUri(Uri.parse(logoutRedirect))
             .setAdditionalParameters(mapOf(REDIRECT_PARAM_NAME to logoutRedirect))
@@ -238,6 +218,33 @@ class KindeSDK(
         loginHint: String? = null,
         additionalParams: Map<String, String>
     ) {
+        if (context !is ComponentActivity) {
+            throw (IllegalStateException("Activity must be instance of ComponentActivity"))
+            return
+        }
+        val launcher = context.registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            val data = result.data
+
+            if (result.resultCode == ComponentActivity.RESULT_CANCELED && data != null) {
+                val ex = AuthorizationException.fromIntent(data)
+                ex?.let { sdkListener.onException(LogoutException("${ex.errorDescription}")) }
+            }
+
+            if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
+                val resp = AuthorizationResponse.fromIntent(data)
+                val ex = AuthorizationException.fromIntent(data)
+                state.update(resp, ex)
+                store.saveState(state.jsonSerializeString())
+                resp?.let {
+                    thread {
+                        getToken(resp.createTokenExchangeRequest())
+                    }
+                }
+                ex?.let { sdkListener.onException(AuthException("${ex.error} ${ex.errorDescription}")) }
+            }
+        }
         val verifier =
             if (type == GrantType.PKCE) CodeVerifierUtil.generateRandomCodeVerifier() else null
         val authRequestBuilder = AuthorizationRequest.Builder(
