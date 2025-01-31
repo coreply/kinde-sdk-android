@@ -1,11 +1,14 @@
 package au.kinde.sdk
 
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Base64.URL_SAFE
 import android.util.Base64.decode
+import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import au.kinde.sdk.api.* // ktlint-disable no-wildcard-imports
 import au.kinde.sdk.api.model.* // ktlint-disable no-wildcard-imports
@@ -60,6 +63,9 @@ class KindeSDK(
 
     private val authService = AuthorizationService(context)
 
+    private var launcher: ActivityResultLauncher<Intent>? = null
+    private var endTokenLauncher: ActivityResultLauncher<Intent>? = null
+
     private val domain: String
     private val clientId: String
     private val audience: String?
@@ -70,6 +76,7 @@ class KindeSDK(
     private val keysApi: KeysApi
     private val oAuthApi: OAuthApi
     private val usersApi: UsersApi
+
 
     init {
         val appInfo = context.packageManager.getApplicationInfo(
@@ -118,7 +125,8 @@ class KindeSDK(
 
         apiClient = ApiClient(HTTPS.format(domain), authNames = arrayOf(BEARER_AUTH))
 
-        tokenRepository = TokenRepository(apiClient.createService(TokenApi::class.java), BuildConfig.SDK_VERSION)
+        tokenRepository = TokenRepository(apiClient.createService(TokenApi::class.java),
+            BuildConfig.SDK_VERSION)
 
         keysApi = apiClient.createService(KeysApi::class.java)
         oAuthApi = apiClient.createService(OAuthApi::class.java)
@@ -149,6 +157,46 @@ class KindeSDK(
             sdkListener.onLogout()
         }
         ClaimDelegate.tokenProvider = this
+
+        if (context is ComponentActivity) {
+            launcher = context.registerForActivityResult(
+                ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                val data = result.data
+
+                if (result.resultCode == ComponentActivity.RESULT_CANCELED && data != null) {
+                    val ex = AuthorizationException.fromIntent(data)
+                    ex?.let { sdkListener.onException(LogoutException("${ex.errorDescription}")) }
+                }
+
+                if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
+                    val resp = AuthorizationResponse.fromIntent(data)
+                    val ex = AuthorizationException.fromIntent(data)
+                    state.update(resp, ex)
+                    store.saveState(state.jsonSerializeString())
+                    resp?.let {
+                        thread {
+                            getToken(resp.createTokenExchangeRequest())
+                        }
+                    }
+                    ex?.let { sdkListener.onException(AuthException("${ex.error} ${ex.errorDescription}")) }
+                }
+            }
+
+            endTokenLauncher = context.registerForActivityResult(
+                ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                val data = result.data
+                if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
+                    val resp = EndSessionResponse.fromIntent(data)
+                    val ex = AuthorizationException.fromIntent(data)
+                    apiClient.setBearerToken("")
+                    sdkListener.onLogout()
+                    store.clearState()
+                    ex?.let { sdkListener.onException(LogoutException("${ex.error} ${ex.errorDescription}")) }
+                }
+            }
+        }
     }
 
     override fun getToken(tokenType: TokenType): String? =
@@ -176,30 +224,18 @@ class KindeSDK(
     }
 
     fun logout() {
-        if (context !is ComponentActivity) {
-            throw (IllegalStateException("Activity must be instance of ComponentActivity"))
-            return
+        if (endTokenLauncher==null){
+            throw (IllegalStateException("Cannot launch logout activity. The supplied context is not an activity."))
         }
-        val endTokenLauncher = context.registerForActivityResult(
-            ActivityResultContracts.StartActivityForResult()
-        ) { result ->
-            val data = result.data
-            if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
-                val resp = EndSessionResponse.fromIntent(data)
-                val ex = AuthorizationException.fromIntent(data)
-                apiClient.setBearerToken("")
-                sdkListener.onLogout()
-                store.clearState()
-                ex?.let { sdkListener.onException(LogoutException("${ex.error} ${ex.errorDescription}")) }
-            }
+        else{
+            val endSessionRequest = EndSessionRequest.Builder(serviceConfiguration)
+                .setPostLogoutRedirectUri(Uri.parse(logoutRedirect))
+                .setAdditionalParameters(mapOf(REDIRECT_PARAM_NAME to logoutRedirect))
+                .setState(null)
+                .build()
+            val endSessionIntent = authService.getEndSessionRequestIntent(endSessionRequest)
+            endTokenLauncher?.launch(endSessionIntent)
         }
-        val endSessionRequest = EndSessionRequest.Builder(serviceConfiguration)
-            .setPostLogoutRedirectUri(Uri.parse(logoutRedirect))
-            .setAdditionalParameters(mapOf(REDIRECT_PARAM_NAME to logoutRedirect))
-            .setState(null)
-            .build()
-        val endSessionIntent = authService.getEndSessionRequestIntent(endSessionRequest)
-        endTokenLauncher.launch(endSessionIntent)
     }
 
     fun isAuthenticated() = state.isAuthorized && checkToken()
@@ -218,65 +254,42 @@ class KindeSDK(
         loginHint: String? = null,
         additionalParams: Map<String, String>
     ) {
-        if (context !is ComponentActivity) {
-            throw (IllegalStateException("Activity must be instance of ComponentActivity"))
-            return
-        }
-        val launcher = context.registerForActivityResult(
-            ActivityResultContracts.StartActivityForResult()
-        ) { result ->
-            val data = result.data
-
-            if (result.resultCode == ComponentActivity.RESULT_CANCELED && data != null) {
-                val ex = AuthorizationException.fromIntent(data)
-                ex?.let { sdkListener.onException(LogoutException("${ex.errorDescription}")) }
-            }
-
-            if (result.resultCode == ComponentActivity.RESULT_OK && data != null) {
-                val resp = AuthorizationResponse.fromIntent(data)
-                val ex = AuthorizationException.fromIntent(data)
-                state.update(resp, ex)
-                store.saveState(state.jsonSerializeString())
-                resp?.let {
-                    thread {
-                        getToken(resp.createTokenExchangeRequest())
-                    }
-                }
-                ex?.let { sdkListener.onException(AuthException("${ex.error} ${ex.errorDescription}")) }
-            }
-        }
-        val verifier =
-            if (type == GrantType.PKCE) CodeVerifierUtil.generateRandomCodeVerifier() else null
-        val authRequestBuilder = AuthorizationRequest.Builder(
-            serviceConfiguration, // the authorization service configuration
-            clientId, // the client ID, typically pre-registered and static
-            ResponseTypeValues.CODE, // the response_type value: we want a code
-            Uri.parse(loginRedirect)
-        )
-            .setCodeVerifier(verifier)
-            .setAdditionalParameters(
-                buildMap {
-                    putAll(additionalParams)
-                    audience?.let {
-                        put(AUDIENCE_PARAM_NAME, audience)
-                    }
-                    orgCode?.let {
-                        put(ORG_CODE_PARAM_NAME, orgCode)
-                    }
-                }
+        if (launcher==null) {
+            throw (IllegalStateException("Cannot launch login activity. The supplied context is not an activity."))
+        } else{
+            val verifier =
+                if (type == GrantType.PKCE) CodeVerifierUtil.generateRandomCodeVerifier() else null
+            val authRequestBuilder = AuthorizationRequest.Builder(
+                serviceConfiguration, // the authorization service configuration
+                clientId, // the client ID, typically pre-registered and static
+                ResponseTypeValues.CODE, // the response_type value: we want a code
+                Uri.parse(loginRedirect)
             )
+                .setCodeVerifier(verifier)
+                .setAdditionalParameters(
+                    buildMap {
+                        putAll(additionalParams)
+                        audience?.let {
+                            put(AUDIENCE_PARAM_NAME, audience)
+                        }
+                        orgCode?.let {
+                            put(ORG_CODE_PARAM_NAME, orgCode)
+                        }
+                    }
+                )
 
-        // Extract and set login_hint if it's provided in additionalParams and is not empty.
-        loginHint?.takeIf { it.isNotEmpty() }?.let {
-            authRequestBuilder.setLoginHint(it)
+            // Extract and set login_hint if it's provided in additionalParams and is not empty.
+            loginHint?.takeIf { it.isNotEmpty() }?.let {
+                authRequestBuilder.setLoginHint(it)
+            }
+
+            val authRequest = authRequestBuilder
+                .setNonce(null)
+                .setScopes(scopes)
+                .build()
+            val authIntent = authService.getAuthorizationRequestIntent(authRequest)
+            launcher?.launch(authIntent)
         }
-
-        val authRequest = authRequestBuilder
-            .setNonce(null)
-            .setScopes(scopes)
-            .build()
-        val authIntent = authService.getAuthorizationRequestIntent(authRequest)
-        launcher.launch(authIntent)
     }
 
     private fun getToken(tokenRequest: TokenRequest): Boolean {
@@ -354,7 +367,7 @@ class KindeSDK(
     private fun isTokenExpired(tokenType: TokenType): Boolean {
         val expClaim = getClaim("exp", tokenType)
         if (expClaim.value != null) {
-            val expireEpochMillis = (expClaim.value as Long) * 1000
+            val expireEpochMillis = expClaim.value.toString().toLong() * 1000
             val currentTimeMillis = System.currentTimeMillis()
 
             if (currentTimeMillis > expireEpochMillis) {
